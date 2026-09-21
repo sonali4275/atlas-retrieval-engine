@@ -87,3 +87,40 @@ else()
         )
 
 endif()
+
+# ============================================================
+# Core Test Executable
+# ============================================================
+
+add_executable(atlas_tests
+
+    tests/test_core.cpp
+
+    src/tokenizer.cpp
+    src/inverted_index.cpp
+    src/query_processor.cpp
+    src/index_serializer.cpp
+)
+
+target_include_directories(atlas_tests
+    PRIVATE
+        ${PROJECT_SOURCE_DIR}/include
+)
+
+if(MSVC)
+
+    target_compile_options(atlas_tests
+        PRIVATE
+            /W4
+    )
+
+else()
+
+    target_compile_options(atlas_tests
+        PRIVATE
+            -Wall
+            -Wextra
+            -Wpedantic
+    )
+
+endif()

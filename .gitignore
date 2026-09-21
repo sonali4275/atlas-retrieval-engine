@@ -68,3 +68,6 @@ vcpkg_installed/
 Testing/
 .cache/
 atlas.index
+
+# saved indexes
+*.index

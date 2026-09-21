@@ -7,139 +7,82 @@
 
 #include "search_result.h"
 
-// Forward declaration.
-// IndexSerializer is allowed to access the internal index data
-// for saving and loading the persisted index.
 class IndexSerializer;
 
-struct Posting {
-    int document_id;
-    std::vector<int> positions;
-};
-
+// In-memory positional inverted index with BM25 ranking.
+//
+// Thread safety: every const method is safe to call concurrently from many
+// threads (there are no mutable caches). add_document() needs exclusive
+// access.
 class InvertedIndex {
 public:
+    // document_id -> ascending token positions of one term in that document.
+    using PostingMap = std::unordered_map<int, std::vector<int>>;
 
-    // Add a document to the inverted index.
-    void add_document(
-        int document_id,
-        const std::vector<std::string>& tokens
-    );
+    // Adds a document. Re-adding an existing id replaces the old content
+    // (old postings are removed; this costs O(vocabulary)).
+    void add_document(int document_id, const std::vector<std::string>& tokens);
 
-    // Normal BM25 search.
-    std::vector<SearchResult> search(
-        const std::vector<std::string>& query_tokens,
-        std::size_t top_k = 10
-    ) const;
+    // BM25 ranking over the union of the query terms.
+    std::vector<SearchResult> search(const std::vector<std::string>& query_tokens,
+                                     std::size_t top_k = 10) const;
 
-    // Phrase search using positional information.
+    // Documents containing the query terms consecutively, ranked with BM25
+    // using the number of phrase occurrences as the term frequency.
     std::vector<SearchResult> phrase_search(
         const std::vector<std::string>& query_tokens,
-        std::size_t top_k = 10
-    ) const;
+        std::size_t top_k = 10) const;
 
-    // Return the number of indexed documents.
+    // BM25-ranks only the given candidate documents (used by Boolean search).
+    // With no query terms every candidate scores 0 and ties break by id.
+    std::vector<SearchResult> rank_candidates(
+        const std::vector<std::string>& query_tokens,
+        const std::vector<int>& candidate_ids, std::size_t top_k) const;
+
+    // Ascending ids of documents containing `term` (empty if unknown).
+    std::vector<int> documents_containing(const std::string& term) const;
+
+    // Ascending ids of every indexed document.
+    std::vector<int> all_document_ids() const;
+
     int document_count() const;
 
 private:
-
-    /*
-     * ============================================================
-     * SERIALIZATION ACCESS
-     * ============================================================
-     */
-
-    // IndexSerializer needs direct access to the internal index
-    // when saving and loading the persisted index.
     friend class IndexSerializer;
 
+    struct ScoredDocument {
+        int document_id;
+        double score;
+    };
 
-    /*
-     * ============================================================
-     * INDEX DATA
-     * ============================================================
-     */
-
-    // Inverted index:
-    //
-    // term
-    //   -> document_id
-    //       -> token positions
-    //
-    // Example:
-    // "vector" -> { 1: [3], 3: [0, 5] }
-    std::unordered_map<
-        std::string,
-        std::unordered_map<int, std::vector<int>>
-    > index_;
+    // term -> (document_id -> positions)
+    std::unordered_map<std::string, PostingMap> index_;
 
     // document_id -> number of tokens in that document.
     std::unordered_map<int, int> document_lengths_;
 
-
-    /*
-     * ============================================================
-     * PERFORMANCE CACHE
-     * ============================================================
-     */
-
-    // Total number of tokens across all indexed documents.
     std::size_t total_document_length_ = 0;
 
-    // Cached average document length.
-    mutable double cached_average_document_length_ = 0.0;
-
-    // Indicates whether the cached average document length is valid.
-    mutable bool average_length_cached_ = false;
-
-    // Cached IDF values.
-    mutable std::unordered_map<
-        std::string,
-        double
-    > idf_cache_;
-
-
-    /*
-     * ============================================================
-     * SCORING
-     * ============================================================
-     */
-
-    // Calculate average document length.
     double average_document_length() const;
+    double idf(std::size_t document_frequency) const;
 
-    // Calculate inverse document frequency.
-    double calculate_idf(
-        const std::string& term
-    ) const;
+    static double bm25_term_score(double idf, double term_frequency,
+                                  double document_length,
+                                  double average_length);
 
-    // Calculate BM25 score for a term/document pair.
-    double calculate_bm25_score(
-        const std::string& term,
-        int document_id
-    ) const;
+    void remove_document_postings(int document_id);
 
+    // Start positions of the phrase in one document, given the posting map of
+    // each phrase term in order. Empty if the phrase does not occur.
+    static std::vector<int> phrase_starts(
+        const std::vector<const PostingMap*>& lists, int document_id);
 
-    /*
-     * ============================================================
-     * PHRASE SEARCH
-     * ============================================================
-     */
+    // Keeps the best top_k documents, then attaches matched terms and
+    // positions to those winners only.
+    std::vector<SearchResult> build_results(
+        std::vector<ScoredDocument> scored,
+        const std::vector<std::string>& terms, std::size_t top_k) const;
 
-    // Check whether the query terms occur consecutively
-    // in the specified document.
-    bool matches_phrase(
-        const std::vector<std::string>& query_tokens,
-        int document_id
-    ) const;
-
-
-    /*
-     * ============================================================
-     * BM25 PARAMETERS
-     * ============================================================
-     */
-
-    static constexpr double k1 = 1.2;
-    static constexpr double b = 0.75;
+    static constexpr double kBm25K1 = 1.2;
+    static constexpr double kBm25B = 0.75;
 };

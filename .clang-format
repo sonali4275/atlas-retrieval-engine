@@ -1,0 +1,5 @@
+# Run `clang-format -i src/*.cpp include/*.h tests/*.cpp` to apply.
+BasedOnStyle: Google
+IndentWidth: 4
+AccessModifierOffset: -4
+ColumnLimit: 80

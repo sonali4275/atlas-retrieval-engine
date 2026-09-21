@@ -1,35 +1,42 @@
 #include "tokenizer.h"
 
-#include <cctype>
-#include <sstream>
+namespace {
 
-std::string Tokenizer::normalize(const std::string& token) const {
-    std::string result;
-
-    for (char ch : token) {
-        unsigned char c = static_cast<unsigned char>(ch);
-
-        if (std::isalnum(c)) {
-            result += static_cast<char>(std::tolower(c));
-        }
-    }
-
-    return result;
+bool is_ascii_alnum(unsigned char c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') ||
+           (c >= 'A' && c <= 'Z');
 }
+
+char to_lower_ascii(unsigned char c) {
+    return static_cast<char>((c >= 'A' && c <= 'Z') ? c - 'A' + 'a' : c);
+}
+
+}  // namespace
 
 std::vector<std::string> Tokenizer::tokenize(const std::string& text) const {
     std::vector<std::string> tokens;
+    std::string current;
 
-    std::istringstream stream(text);
-    std::string word;
+    auto flush = [&]() {
+        if (!current.empty()) {
+            tokens.push_back(std::move(current));
+            current.clear();
+        }
+    };
 
-    while (stream >> word) {
-        std::string normalized = normalize(word);
+    for (std::size_t i = 0; i < text.size(); ++i) {
+        const unsigned char c = static_cast<unsigned char>(text[i]);
 
-        if (!normalized.empty()) {
-            tokens.push_back(normalized);
+        if (is_ascii_alnum(c)) {
+            current += to_lower_ascii(c);
+        } else if (c == '\'' && !current.empty() && i + 1 < text.size() &&
+                   is_ascii_alnum(static_cast<unsigned char>(text[i + 1]))) {
+            // Apostrophe inside a word ("don't"): join, don't split.
+        } else {
+            flush();
         }
     }
+    flush();
 
     return tokens;
 }

@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: "ubuntu / gcc",   os: ubuntu-latest, cxx: g++ }
+          - { name: "ubuntu / clang", os: ubuntu-latest, cxx: clang++ }
+          - { name: "macos / clang",  os: macos-latest,  cxx: clang++ }
+    env:
+      CXX: ${{ matrix.cxx }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DATLAS_WARNINGS_AS_ERRORS=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Benchmark smoke run (tiny corpus)
+        run: ./build/atlas_benchmark --docs 2000 --reps 5
+
+  sanitizers:
+    name: ${{ matrix.sanitizer }} sanitizer
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [address, thread]
+    env:
+      CXX: clang++
+    steps:
+      - uses: actions/checkout@v4
+
+      # TSan can crash on newer kernels with high-entropy ASLR.
+      - name: Lower ASLR entropy (TSan compatibility)
+        if: matrix.sanitizer == 'thread'
+        run: sudo sysctl vm.mmap_rnd_bits=28
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+          -DATLAS_SANITIZER=${{ matrix.sanitizer }}
+          -DATLAS_BUILD_BENCHMARKS=OFF
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test under sanitizer
+        run: ctest --test-dir build --output-on-failure

@@ -1,297 +1,199 @@
+// Atlas Retrieval Engine - benchmark.
+//
+//   atlas_benchmark [--docs N] [--doc-length N] [--vocab N] [--reps N] [--seed N]
+//
+// The corpus is synthetic but Zipf-distributed (term i has weight 1/(i+1)),
+// which is how real text behaves: a few terms are in almost every document and
+// most terms are rare. Each query is warmed up, then timed `reps` times with a
+// monotonic clock; the table reports the median and 99th percentile.
+// Build with -O2 (the default CMake build type here is Release).
+
+#include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <random>
 #include <string>
 #include <vector>
 
+#include "index_serializer.h"
 #include "inverted_index.h"
+#include "query_processor.h"
 #include "tokenizer.h"
 
-struct BenchmarkDocument {
-    int id;
-    std::string text;
+namespace {
+
+using Clock = std::chrono::steady_clock;
+
+double elapsed_ms(Clock::time_point start) {
+    return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+}
+
+// Resident set size in MB (Linux only; -1 elsewhere).
+long resident_mb() {
+#ifdef __linux__
+    std::ifstream status("/proc/self/status");
+    std::string line;
+    while (std::getline(status, line)) {
+        if (line.rfind("VmRSS:", 0) == 0) return std::stol(line.substr(6)) / 1024;
+    }
+#endif
+    return -1;
+}
+
+struct Config {
+    int documents = 50000;
+    int doc_length = 80;
+    int vocabulary = 50000;
+    int reps = 30;
+    unsigned seed = 42;
 };
 
-struct QueryBenchmarkResult {
+Config parse_config(int argc, char** argv) {
+    Config config;
+    for (int i = 1; i + 1 < argc; i += 2) {
+        const std::string flag = argv[i];
+        const long value = std::strtol(argv[i + 1], nullptr, 10);
+        if (value <= 0) continue;
+        if (flag == "--docs") config.documents = static_cast<int>(value);
+        else if (flag == "--doc-length") config.doc_length = static_cast<int>(value);
+        else if (flag == "--vocab") config.vocabulary = static_cast<int>(value);
+        else if (flag == "--reps") config.reps = static_cast<int>(value);
+        else if (flag == "--seed") config.seed = static_cast<unsigned>(value);
+    }
+    return config;
+}
+
+struct Row {
+    std::string kind;
     std::string query;
-    double search_time_ms;
-    std::size_t results_returned;
+    double p50_ms;
+    double p99_ms;
+    std::size_t hits;
 };
 
-int main() {
+template <typename Fn>
+Row measure(const std::string& kind, const std::string& query, int reps, Fn run) {
+    for (int i = 0; i < 3; ++i) run();  // warm-up
+    std::vector<double> samples;
+    std::size_t hits = 0;
+    for (int i = 0; i < reps; ++i) {
+        const auto start = Clock::now();
+        hits = run();
+        samples.push_back(elapsed_ms(start));
+    }
+    std::sort(samples.begin(), samples.end());
+    const auto percentile = [&](double p) {  // nearest-rank
+        const std::size_t rank = static_cast<std::size_t>(
+            std::max(1.0, std::ceil(p * static_cast<double>(samples.size()))));
+        return samples[rank - 1];
+    };
+    return {kind, query, percentile(0.50), percentile(0.99), hits};
+}
 
-    std::cout << "Atlas Retrieval Engine - Benchmark\n";
-    std::cout << "==================================\n\n";
+}  // namespace
+
+int main(int argc, char** argv) {
+    const Config config = parse_config(argc, argv);
+
+    // ---------------------------------------------------------- build corpus
+    std::mt19937 rng(config.seed);
+    std::vector<double> weights(static_cast<std::size_t>(config.vocabulary));
+    for (std::size_t i = 0; i < weights.size(); ++i)
+        weights[i] = 1.0 / static_cast<double>(i + 1);
+    std::discrete_distribution<int> zipf(weights.begin(), weights.end());
 
     Tokenizer tokenizer;
     InvertedIndex index;
-
-    const int document_count = 10000;
-    const std::size_t top_k = 10;
-
-    std::vector<BenchmarkDocument> documents;
-    documents.reserve(document_count);
-
-    /*
-     * ============================================================
-     * GENERATE SYNTHETIC CORPUS
-     * ============================================================
-     */
-
-    for (int i = 1; i <= document_count; ++i) {
-
-        BenchmarkDocument document;
-        document.id = i;
-
-        document.text =
-            "technical system architecture "
-            "software engineering distributed computing "
-            "performance reliability scalability ";
-
-        if (i % 2 == 0) {
-
-            document.text +=
-                "vector search indexing "
-                "similarity retrieval ";
-        }
-
-        if (i % 3 == 0) {
-
-            document.text +=
-                "database storage query processing ";
-        }
-
-        if (i % 5 == 0) {
-
-            document.text +=
-                "search engine ranking "
-                "document retrieval ";
-        }
-
-        if (i % 7 == 0) {
-
-            document.text +=
-                "machine learning embeddings "
-                "vector database ";
-        }
-
-        if (i % 11 == 0) {
-
-            document.text +=
-                "distributed search "
-                "index optimization ";
-        }
-
-        if (i % 13 == 0) {
-
-            document.text +=
-                "performance optimization "
-                "memory management "
-                "concurrent processing "
-                "query execution "
-                "system monitoring ";
-        }
-
-        document.text +=
-            "document number " +
-            std::to_string(i);
-
-        documents.push_back(document);
-    }
-
-
-    /*
-     * ============================================================
-     * INDEXING BENCHMARK
-     * ============================================================
-     */
-
-    auto indexing_start =
-        std::chrono::high_resolution_clock::now();
-
+    const long memory_before = resident_mb();
     std::size_t total_tokens = 0;
+    double tokenize_ms = 0.0;
+    double index_ms = 0.0;
 
-    for (const auto& document : documents) {
+    for (int d = 1; d <= config.documents; ++d) {
+        std::string text;
+        text.reserve(static_cast<std::size_t>(config.doc_length) * 7);
+        for (int j = 0; j < config.doc_length; ++j) {
+            text += 'w';
+            text += std::to_string(zipf(rng));
+            text += ' ';
+        }
+        auto start = Clock::now();
+        const std::vector<std::string> tokens = tokenizer.tokenize(text);
+        tokenize_ms += elapsed_ms(start);
 
-        std::vector<std::string> tokens =
-            tokenizer.tokenize(document.text);
-
+        start = Clock::now();
+        index.add_document(d, tokens);
+        index_ms += elapsed_ms(start);
         total_tokens += tokens.size();
+    }
+    const long memory_mb = resident_mb() - memory_before;
+    const double build_ms = tokenize_ms + index_ms;
 
-        index.add_document(
-            document.id,
-            tokens
-        );
+    std::cout << std::fixed << std::setprecision(2);
+    std::cout << "## Corpus\n\n"
+              << "| Documents | Tokens | Vocabulary | Seed |\n|---|---|---|---|\n"
+              << "| " << config.documents << " | " << total_tokens << " | "
+              << config.vocabulary << " | " << config.seed << " |\n\n";
+
+    std::cout << "## Indexing\n\n"
+              << "| Metric | Value |\n|---|---|\n"
+              << "| Tokenize + index time | " << build_ms << " ms |\n"
+              << "| Throughput | "
+              << static_cast<double>(total_tokens) / (build_ms / 1000.0) / 1e6
+              << " M tokens/s |\n";
+    if (memory_mb >= 0) {
+        std::cout << "| Memory (RSS growth) | ~" << memory_mb << " MB (~"
+                  << static_cast<double>(memory_mb) * 1024.0 * 1024.0 /
+                         static_cast<double>(total_tokens)
+                  << " bytes/token) |\n";
+    }
+    std::cout << '\n';
+
+    // -------------------------------------------------------------- queries
+    const QueryProcessor q(tokenizer, index);
+    const int reps = config.reps;
+    std::vector<Row> rows;
+
+    for (const char* query : {"w1 w3", "w100 w500", "w20000"})
+        rows.push_back(measure("BM25", query, reps, [&] { return q.search(query, 10).size(); }));
+    for (const char* query : {"w1 w2", "w2 w5 w9"})
+        rows.push_back(measure("Phrase", query, reps, [&] { return q.phrase_search(query, 10).size(); }));
+    for (const char* query : {"w1 AND w3", "w1 OR w3", "w1 AND NOT w3",
+                              "w100 AND w500", "NOT w1"})
+        rows.push_back(measure("Boolean", query, reps, [&] { return q.boolean_search(query, 10).size(); }));
+
+    std::cout << "## Query latency (top-10, " << reps << " runs each)\n\n"
+              << "| Type | Query | p50 (ms) | p99 (ms) | Hits |\n|---|---|---|---|---|\n";
+    std::cout << std::setprecision(3);
+    for (const Row& r : rows) {
+        std::cout << "| " << r.kind << " | `" << r.query << "` | " << r.p50_ms
+                  << " | " << r.p99_ms << " | " << r.hits << " |\n";
     }
 
-    auto indexing_end =
-        std::chrono::high_resolution_clock::now();
+    // -------------------------------------------------------- serialization
+    const std::string path =
+        (std::filesystem::temp_directory_path() / "atlas_benchmark.index").string();
+    auto start = Clock::now();
+    const bool saved = IndexSerializer::save(index, path);
+    const double save_ms = elapsed_ms(start);
 
-    const std::chrono::duration<double, std::milli>
-        indexing_time =
-            indexing_end - indexing_start;
+    InvertedIndex loaded;
+    start = Clock::now();
+    const bool loaded_ok = IndexSerializer::load(loaded, path);
+    const double load_ms = elapsed_ms(start);
+    const double file_mb = saved ? static_cast<double>(std::filesystem::file_size(path)) / 1e6 : 0.0;
+    std::filesystem::remove(path);
 
+    std::cout << "\n## Persistence\n\n"
+              << "| Save | Load (with full validation) | File size |\n|---|---|---|\n"
+              << std::setprecision(1) << "| " << save_ms << " ms | " << load_ms
+              << " ms | " << file_mb << " MB |\n";
 
-    /*
-     * ============================================================
-     * MULTI-QUERY SEARCH BENCHMARK
-     * ============================================================
-     */
-
-    const std::vector<std::string> queries = {
-        "vector search",
-        "retrieval search",
-        "database",
-        "machine learning",
-        "index optimization"
-    };
-
-    std::vector<QueryBenchmarkResult> benchmark_results;
-
-    benchmark_results.reserve(queries.size());
-
-    for (const auto& query : queries) {
-
-        std::vector<std::string> query_tokens =
-            tokenizer.tokenize(query);
-
-        auto search_start =
-            std::chrono::high_resolution_clock::now();
-
-        std::vector<SearchResult> results =
-            index.search(
-                query_tokens,
-                top_k
-            );
-
-        auto search_end =
-            std::chrono::high_resolution_clock::now();
-
-        const std::chrono::duration<double, std::milli>
-            search_time =
-                search_end - search_start;
-
-        benchmark_results.push_back(
-            {
-                query,
-                search_time.count(),
-                results.size()
-            }
-        );
-    }
-
-
-    /*
-     * ============================================================
-     * OUTPUT
-     * ============================================================
-     */
-
-    std::cout
-        << "Benchmark configuration\n";
-
-    std::cout
-        << "-----------------------\n";
-
-    std::cout
-        << "Documents: "
-        << index.document_count()
-        << "\n";
-
-    std::cout
-        << "Total tokens: "
-        << total_tokens
-        << "\n";
-
-    std::cout
-        << "Top-K: "
-        << top_k
-        << "\n\n";
-
-
-    std::cout
-        << "Indexing benchmark\n";
-
-    std::cout
-        << "------------------\n";
-
-    std::cout
-        << std::fixed
-        << std::setprecision(4);
-
-    std::cout
-        << "Indexing time: "
-        << indexing_time.count()
-        << " ms\n\n";
-
-
-    /*
-     * ============================================================
-     * QUERY RESULTS
-     * ============================================================
-     */
-
-    std::cout
-        << "Query benchmarks\n";
-
-    std::cout
-        << "----------------\n";
-
-    for (const auto& result : benchmark_results) {
-
-        std::cout
-            << "Query: "
-            << result.query
-            << "\n";
-
-        std::cout
-            << "Search time: "
-            << result.search_time_ms
-            << " ms\n";
-
-        std::cout
-            << "Results returned: "
-            << result.results_returned
-            << "\n\n";
-    }
-
-
-    /*
-     * ============================================================
-     * TOP RESULTS FOR PRIMARY QUERY
-     * ============================================================
-     */
-
-    const std::string primary_query =
-        "vector search";
-
-    std::vector<std::string> primary_tokens =
-        tokenizer.tokenize(primary_query);
-
-    std::vector<SearchResult> primary_results =
-        index.search(
-            primary_tokens,
-            top_k
-        );
-
-    std::cout
-        << "Top results for: "
-        << primary_query
-        << "\n";
-
-    std::cout
-        << "-------------------------------\n";
-
-    for (const auto& result : primary_results) {
-
-        std::cout
-            << "Document ID: "
-            << result.document_id
-            << " | Score: "
-            << result.score
-            << "\n";
-    }
-
-
-    return 0;
+    return (saved && loaded_ok) ? 0 : 1;
 }

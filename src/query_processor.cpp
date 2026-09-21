@@ -1,871 +1,322 @@
 #include "query_processor.h"
 
 #include <algorithm>
-#include <cctype>
-#include <functional>
-#include <unordered_map>
-#include <unordered_set>
-#include <vector>
+#include <iterator>
+#include <memory>
+#include <utility>
 
 namespace {
 
-struct BooleanNode {
+// ------------------------------------------------------------- expression AST
 
-    enum class Type {
-        TERM,
-        AND,
-        OR,
-        NOT
-    };
+struct Node {
+    enum class Type { Term, And, Or, Not };
+
+    explicit Node(Type node_type, std::string node_term = {})
+        : type(node_type), term(std::move(node_term)) {}
 
     Type type;
-
-    std::string term;
-
-    BooleanNode* left;
-    BooleanNode* right;
-
-    BooleanNode(
-        Type node_type,
-        const std::string& node_term = ""
-    )
-        : type(node_type),
-          term(node_term),
-          left(nullptr),
-          right(nullptr) {
-    }
+    std::string term;            // Term only
+    std::unique_ptr<Node> left;  // And, Or, Not (the negated child)
+    std::unique_ptr<Node> right; // And, Or
 };
 
-void delete_tree(BooleanNode* node) {
+using NodePtr = std::unique_ptr<Node>;
 
-    if (node == nullptr) {
-        return;
+NodePtr make_binary(Node::Type type, NodePtr left, NodePtr right) {
+    auto node = std::make_unique<Node>(type);
+    node->left = std::move(left);
+    node->right = std::move(right);
+    return node;
+}
+
+NodePtr make_not(NodePtr child) {
+    auto node = std::make_unique<Node>(Node::Type::Not);
+    node->left = std::move(child);
+    return node;
+}
+
+// ------------------------------------------------------------------- parser
+//
+//   or      := and { "or" and }
+//   and     := not { ("and" | "not") not }     // "A not B" == "A and not B"
+//   not     := "not" not | primary
+//   primary := TERM | "(" or ")"
+//
+// Recursive descent. Every failure path sets a message and returns nullptr;
+// ownership is handled by unique_ptr so nothing leaks on error.
+class Parser {
+public:
+    explicit Parser(const std::vector<std::string>& tokens) : tokens_(tokens) {}
+
+    NodePtr parse() {
+        NodePtr root = parse_or();
+        if (root && pos_ < tokens_.size()) {
+            fail("unexpected '" + tokens_[pos_] +
+                 "' (put AND, OR or NOT between terms)");
+            return nullptr;
+        }
+        return root;
     }
 
-    delete_tree(node->left);
-    delete_tree(node->right);
+    const std::string& error() const { return error_; }
 
-    delete node;
+private:
+    bool at(const char* word) const {
+        return pos_ < tokens_.size() && tokens_[pos_] == word;
+    }
+
+    void fail(std::string message) {
+        if (error_.empty()) error_ = std::move(message);
+    }
+
+    NodePtr parse_or() {
+        NodePtr left = parse_and();
+        if (!left) return nullptr;
+        while (at("or")) {
+            ++pos_;
+            NodePtr right = parse_and();
+            if (!right) return nullptr;
+            left = make_binary(Node::Type::Or, std::move(left), std::move(right));
+        }
+        return left;
+    }
+
+    NodePtr parse_and() {
+        NodePtr left = parse_not();
+        if (!left) return nullptr;
+        for (;;) {
+            if (at("and")) {
+                ++pos_;
+                NodePtr right = parse_not();
+                if (!right) return nullptr;
+                left = make_binary(Node::Type::And, std::move(left),
+                                   std::move(right));
+            } else if (at("not")) {
+                ++pos_;
+                NodePtr child = parse_not();
+                if (!child) return nullptr;
+                left = make_binary(Node::Type::And, std::move(left),
+                                   make_not(std::move(child)));
+            } else {
+                return left;
+            }
+        }
+    }
+
+    NodePtr parse_not() {
+        if (at("not")) {
+            ++pos_;
+            NodePtr child = parse_not();
+            if (!child) return nullptr;
+            return make_not(std::move(child));
+        }
+        return parse_primary();
+    }
+
+    NodePtr parse_primary() {
+        if (pos_ >= tokens_.size()) {
+            fail("unexpected end of query");
+            return nullptr;
+        }
+        const std::string& token = tokens_[pos_];
+        if (token == "(") {
+            ++pos_;
+            NodePtr inner = parse_or();
+            if (!inner) return nullptr;
+            if (!at(")")) {
+                fail("missing closing parenthesis");
+                return nullptr;
+            }
+            ++pos_;
+            return inner;
+        }
+        if (token == ")") {
+            fail("unexpected ')'");
+            return nullptr;
+        }
+        if (token == "and" || token == "or") {
+            fail("operator '" + token + "' needs a term on both sides");
+            return nullptr;
+        }
+        ++pos_;
+        return std::make_unique<Node>(Node::Type::Term, token);
+    }
+
+    const std::vector<std::string>& tokens_;
+    std::size_t pos_ = 0;
+    std::string error_;
+};
+
+// --------------------------------------------------------------- evaluation
+
+using DocIds = std::vector<int>;  // always sorted ascending
+
+DocIds intersect(const DocIds& a, const DocIds& b) {
+    DocIds out;
+    std::set_intersection(a.begin(), a.end(), b.begin(), b.end(),
+                          std::back_inserter(out));
+    return out;
 }
 
-} // namespace
-
-
-QueryProcessor::QueryProcessor(
-    const Tokenizer& tokenizer,
-    const InvertedIndex& index
-)
-    : tokenizer_(tokenizer),
-      index_(index) {
+DocIds unite(const DocIds& a, const DocIds& b) {
+    DocIds out;
+    std::set_union(a.begin(), a.end(), b.begin(), b.end(),
+                   std::back_inserter(out));
+    return out;
 }
 
-
-/*
- * ============================================================
- * NORMAL SEARCH
- * ============================================================
- */
-
-std::vector<SearchResult> QueryProcessor::search(
-    const std::string& query,
-    std::size_t top_k
-) const {
-
-    const std::vector<std::string> query_tokens =
-        tokenizer_.tokenize(query);
-
-    return index_.search(
-        query_tokens,
-        top_k
-    );
+DocIds subtract(const DocIds& a, const DocIds& b) {
+    DocIds out;
+    std::set_difference(a.begin(), a.end(), b.begin(), b.end(),
+                        std::back_inserter(out));
+    return out;
 }
 
+// Evaluates the tree to the sorted set of matching document ids using posting
+// list set operations. The "all documents" universe is only materialised if a
+// NOT cannot be expressed as a set difference (e.g. a bare "NOT x").
+class Evaluator {
+public:
+    explicit Evaluator(const InvertedIndex& index) : index_(index) {}
 
-/*
- * ============================================================
- * PHRASE SEARCH
- * ============================================================
- */
+    DocIds evaluate(const Node& node) {
+        switch (node.type) {
+            case Node::Type::Term:
+                return index_.documents_containing(node.term);
+            case Node::Type::Or:
+                return unite(evaluate(*node.left), evaluate(*node.right));
+            case Node::Type::Not:
+                return subtract(universe(), evaluate(*node.left));
+            case Node::Type::And: {
+                const Node& l = *node.left;
+                const Node& r = *node.right;
+                // A AND NOT B  ->  A \ B
+                if (r.type == Node::Type::Not)
+                    return subtract(evaluate(l), evaluate(*r.left));
+                if (l.type == Node::Type::Not)
+                    return subtract(evaluate(r), evaluate(*l.left));
+                return intersect(evaluate(l), evaluate(r));
+            }
+        }
+        return {};
+    }
 
-std::vector<SearchResult>
-QueryProcessor::phrase_search(
-    const std::string& query,
-    std::size_t top_k
-) const {
+private:
+    const DocIds& universe() {
+        if (!have_universe_) {
+            universe_ = index_.all_document_ids();
+            have_universe_ = true;
+        }
+        return universe_;
+    }
 
-    const std::vector<std::string> query_tokens =
-        tokenizer_.tokenize(query);
+    const InvertedIndex& index_;
+    DocIds universe_;
+    bool have_universe_ = false;
+};
 
-    return index_.phrase_search(
-        query_tokens,
-        top_k
-    );
+// Terms that can contribute to relevance: those not under an odd number of NOTs.
+void collect_positive_terms(const Node& node, bool negated,
+                            std::vector<std::string>& out) {
+    switch (node.type) {
+        case Node::Type::Term:
+            if (!negated) out.push_back(node.term);
+            return;
+        case Node::Type::Not:
+            collect_positive_terms(*node.left, !negated, out);
+            return;
+        case Node::Type::And:
+        case Node::Type::Or:
+            collect_positive_terms(*node.left, negated, out);
+            collect_positive_terms(*node.right, negated, out);
+            return;
+    }
 }
 
+}  // namespace
 
-/*
- * ============================================================
- * BOOLEAN OPERATOR
- * ============================================================
- */
+// ------------------------------------------------------------ QueryProcessor
 
-bool QueryProcessor::is_boolean_operator(
-    const std::string& token
-) const {
+QueryProcessor::QueryProcessor(const Tokenizer& tokenizer,
+                               const InvertedIndex& index)
+    : tokenizer_(tokenizer), index_(index) {}
 
-    return token == "and" ||
-           token == "or" ||
-           token == "not";
+std::vector<SearchResult> QueryProcessor::search(const std::string& query,
+                                                 std::size_t top_k) const {
+    return index_.search(tokenizer_.tokenize(query), top_k);
 }
 
+std::vector<SearchResult> QueryProcessor::phrase_search(
+    const std::string& query, std::size_t top_k) const {
+    return index_.phrase_search(tokenizer_.tokenize(query), top_k);
+}
 
-/*
- * ============================================================
- * BOOLEAN QUERY TOKENIZER
- * ============================================================
- *
- * Example:
- *
- * vector AND (search OR retrieval)
- *
- * becomes:
- *
- * vector
- * and
- * (
- * search
- * or
- * retrieval
- * )
- *
- * ============================================================
- */
-
-std::vector<std::string>
-QueryProcessor::tokenize_boolean_query(
-    const std::string& query
-) const {
-
+// Splits on whitespace and parentheses, then normalises each word with the
+// same Tokenizer used for documents. A word that normalises to several tokens
+// (e.g. "state-of-the-art") becomes a parenthesised AND of those tokens.
+std::vector<std::string> QueryProcessor::tokenize_boolean_query(
+    const std::string& query) const {
     std::vector<std::string> tokens;
+    std::string word;
 
-    std::string current;
-
-    auto flush_current =
-        [&]() {
-
-            if (current.empty()) {
-                return;
+    auto flush_word = [&]() {
+        if (word.empty()) return;
+        const std::vector<std::string> parts = tokenizer_.tokenize(word);
+        word.clear();
+        if (parts.size() == 1) {
+            tokens.push_back(parts[0]);
+        } else if (parts.size() > 1) {
+            tokens.push_back("(");
+            for (std::size_t i = 0; i < parts.size(); ++i) {
+                if (i > 0) tokens.push_back("and");
+                tokens.push_back(parts[i]);
             }
-
-            std::string normalized;
-
-            for (char character : current) {
-
-                if (std::isalnum(
-                        static_cast<unsigned char>(
-                            character
-                        )
-                    )) {
-
-                    normalized +=
-                        static_cast<char>(
-                            std::tolower(
-                                static_cast<unsigned char>(
-                                    character
-                                )
-                            )
-                        );
-                }
-            }
-
-            if (!normalized.empty()) {
-                tokens.push_back(normalized);
-            }
-
-            current.clear();
-        };
-
-    for (char character : query) {
-
-        if (character == '(' ||
-            character == ')') {
-
-            flush_current();
-
-            tokens.push_back(
-                std::string(1, character)
-            );
-
-            continue;
+            tokens.push_back(")");
         }
+    };
 
-        if (std::isspace(
-                static_cast<unsigned char>(
-                    character
-                )
-            )) {
-
-            flush_current();
-
-            continue;
+    for (char c : query) {
+        if (tokens.size() > kMaxBooleanQueryTokens) break;  // rejected later
+        if (c == '(' || c == ')') {
+            flush_word();
+            tokens.push_back(std::string(1, c));
+        } else if (c == ' ' || c == '\t' || c == '\n' || c == '\r' ||
+                   c == '\f' || c == '\v') {
+            flush_word();
+        } else {
+            word += c;
         }
-
-        current += character;
     }
-
-    flush_current();
-
+    flush_word();
     return tokens;
 }
 
-
-/*
- * ============================================================
- * BOOLEAN SEARCH
- * ============================================================
- *
- * Grammar:
- *
- * expression
- *     = OR
- *
- * OR
- *     = AND { OR AND }
- *
- * AND
- *     = NOT { AND NOT }
- *
- * NOT
- *     = "not" NOT
- *       | primary
- *
- * primary
- *     = TERM
- *       | "(" expression ")"
- *
- * In addition:
- *
- * A NOT B
- *
- * is interpreted as:
- *
- * A AND (NOT B)
- *
- * Therefore:
- *
- * vector NOT databases
- *
- * means:
- *
- * vector AND NOT databases
- *
- * ============================================================
- */
-
-std::vector<SearchResult>
-QueryProcessor::boolean_search(
-    const std::string& query,
-    std::size_t top_k
-) const {
-
-    if (query.empty() ||
-        top_k == 0) {
-
-        return {};
-    }
-
-    const std::vector<std::string> tokens =
-        tokenize_boolean_query(query);
-
-    if (tokens.empty()) {
-        return {};
-    }
-
-    std::size_t position = 0;
-
-
-    /*
-     * Parser functions.
-     */
-
-    std::function<BooleanNode*()> parse_expression;
-    std::function<BooleanNode*()> parse_or;
-    std::function<BooleanNode*()> parse_and;
-    std::function<BooleanNode*()> parse_not;
-    std::function<BooleanNode*()> parse_primary;
-
-
-    /*
-     * ========================================================
-     * PRIMARY
-     * ========================================================
-     */
-
-    parse_primary =
-        [&]() -> BooleanNode* {
-
-        if (position >= tokens.size()) {
-            return nullptr;
-        }
-
-        const std::string& token =
-            tokens[position];
-
-
-        /*
-         * Parenthesized expression.
-         */
-
-        if (token == "(") {
-
-            ++position;
-
-            BooleanNode* node =
-                parse_expression();
-
-            if (position >= tokens.size() ||
-                tokens[position] != ")") {
-
-                delete_tree(node);
-
-                return nullptr;
-            }
-
-            ++position;
-
-            return node;
-        }
-
-
-        /*
-         * Closing parenthesis cannot start
-         * an expression.
-         */
-
-        if (token == ")") {
-            return nullptr;
-        }
-
-
-        /*
-         * Operators cannot directly be terms.
-         */
-
-        if (is_boolean_operator(token)) {
-            return nullptr;
-        }
-
-
-        ++position;
-
-        return new BooleanNode(
-            BooleanNode::Type::TERM,
-            token
-        );
+std::vector<SearchResult> QueryProcessor::boolean_search(
+    const std::string& query, std::size_t top_k, std::string* error) const {
+    if (error) error->clear();
+    auto reject = [&](const std::string& message) {
+        if (error) *error = message;
+        return std::vector<SearchResult>{};
     };
 
-
-    /*
-     * ========================================================
-     * NOT
-     * ========================================================
-     *
-     * Unary NOT has the highest precedence.
-     *
-     * Example:
-     *
-     * NOT database
-     *
-     * ========================================================
-     */
-
-    parse_not =
-        [&]() -> BooleanNode* {
-
-        if (position < tokens.size() &&
-            tokens[position] == "not") {
-
-            ++position;
-
-            BooleanNode* child =
-                parse_not();
-
-            if (child == nullptr) {
-                return nullptr;
-            }
-
-            BooleanNode* node =
-                new BooleanNode(
-                    BooleanNode::Type::NOT
-                );
-
-            node->right = child;
-
-            return node;
-        }
-
-        return parse_primary();
-    };
-
-
-    /*
-     * ========================================================
-     * AND
-     * ========================================================
-     *
-     * Handles:
-     *
-     * A AND B
-     *
-     * A NOT B
-     *
-     * A AND NOT B
-     *
-     * A AND B AND C
-     *
-     * ========================================================
-     */
-
-    parse_and =
-        [&]() -> BooleanNode* {
-
-        BooleanNode* left =
-            parse_not();
-
-        if (left == nullptr) {
-            return nullptr;
-        }
-
-
-        while (position < tokens.size()) {
-
-            /*
-             * Normal AND.
-             */
-
-            if (tokens[position] == "and") {
-
-                ++position;
-
-                BooleanNode* right =
-                    parse_not();
-
-                if (right == nullptr) {
-
-                    delete_tree(left);
-
-                    return nullptr;
-                }
-
-                BooleanNode* parent =
-                    new BooleanNode(
-                        BooleanNode::Type::AND
-                    );
-
-                parent->left = left;
-                parent->right = right;
-
-                left = parent;
-
-                continue;
-            }
-
-
-            /*
-             * Binary NOT.
-             *
-             * A NOT B
-             *
-             * becomes:
-             *
-             * A AND (NOT B)
-             */
-
-            if (tokens[position] == "not") {
-
-                ++position;
-
-                BooleanNode* right =
-                    parse_not();
-
-                if (right == nullptr) {
-
-                    delete_tree(left);
-
-                    return nullptr;
-                }
-
-                BooleanNode* not_node =
-                    new BooleanNode(
-                        BooleanNode::Type::NOT
-                    );
-
-                not_node->right = right;
-
-                BooleanNode* parent =
-                    new BooleanNode(
-                        BooleanNode::Type::AND
-                    );
-
-                parent->left = left;
-                parent->right = not_node;
-
-                left = parent;
-
-                continue;
-            }
-
-            break;
-        }
-
-        return left;
-    };
-
-
-    /*
-     * ========================================================
-     * OR
-     * ========================================================
-     */
-
-    parse_or =
-        [&]() -> BooleanNode* {
-
-        BooleanNode* left =
-            parse_and();
-
-        if (left == nullptr) {
-            return nullptr;
-        }
-
-        while (position < tokens.size() &&
-               tokens[position] == "or") {
-
-            ++position;
-
-            BooleanNode* right =
-                parse_and();
-
-            if (right == nullptr) {
-
-                delete_tree(left);
-
-                return nullptr;
-            }
-
-            BooleanNode* parent =
-                new BooleanNode(
-                    BooleanNode::Type::OR
-                );
-
-            parent->left = left;
-            parent->right = right;
-
-            left = parent;
-        }
-
-        return left;
-    };
-
-
-    /*
-     * ========================================================
-     * EXPRESSION
-     * ========================================================
-     */
-
-    parse_expression =
-        [&]() -> BooleanNode* {
-
-        return parse_or();
-    };
-
-
-    /*
-     * ========================================================
-     * BUILD EXPRESSION TREE
-     * ========================================================
-     */
-
-    BooleanNode* root =
-        parse_expression();
-
-
-    /*
-     * Invalid expression.
-     */
-
-    if (root == nullptr ||
-        position != tokens.size()) {
-
-        delete_tree(root);
-
-        return {};
+    if (top_k == 0) return {};
+
+    const std::vector<std::string> tokens = tokenize_boolean_query(query);
+    if (tokens.empty()) return reject("empty query");
+    if (tokens.size() > kMaxBooleanQueryTokens) {
+        return reject("query too long (max " +
+                      std::to_string(kMaxBooleanQueryTokens) + " tokens)");
     }
 
-
-    /*
-     * ========================================================
-     * COLLECT SEARCH TERMS
-     * ========================================================
-     */
-
-    std::unordered_set<std::string>
-        unique_terms;
-
-    std::function<void(const BooleanNode*)>
-        collect_terms;
-
-    collect_terms =
-        [&](const BooleanNode* node) {
-
-        if (node == nullptr) {
-            return;
-        }
-
-        if (node->type ==
-            BooleanNode::Type::TERM) {
-
-            unique_terms.insert(
-                node->term
-            );
-
-            return;
-        }
-
-        collect_terms(node->left);
-        collect_terms(node->right);
-    };
-
-    collect_terms(root);
-
-
-    if (unique_terms.empty()) {
-
-        delete_tree(root);
-
-        return {};
-    }
-
-
-    std::vector<std::string> terms(
-        unique_terms.begin(),
-        unique_terms.end()
-    );
-
-
-    /*
-     * ========================================================
-     * GET BM25 CANDIDATES
-     * ========================================================
-     */
-
-    const std::size_t candidate_limit =
-        static_cast<std::size_t>(
-            index_.document_count()
-        );
-
-    std::vector<SearchResult> candidates =
-        index_.search(
-            terms,
-            candidate_limit
-        );
-
-
-    /*
-     * ========================================================
-     * BUILD TERM -> DOCUMENT MAP
-     * ========================================================
-     */
-
-    std::unordered_map<
-        std::string,
-        std::unordered_set<int>
-    > term_documents;
-
-    for (const std::string& term : terms) {
-
-        std::vector<SearchResult>
-            term_results =
-                index_.search(
-                    {term},
-                    candidate_limit
-                );
-
-        for (const auto& result :
-             term_results) {
-
-            term_documents[term].insert(
-                result.document_id
-            );
-        }
-    }
-
-
-    /*
-     * ========================================================
-     * EVALUATE BOOLEAN TREE
-     * ========================================================
-     */
-
-    std::function<bool(
-        const BooleanNode*,
-        int
-    )> evaluate;
-
-    evaluate =
-        [&](const BooleanNode* node,
-            int document_id) -> bool {
-
-        if (node == nullptr) {
-            return false;
-        }
-
-
-        /*
-         * TERM
-         */
-
-        if (node->type ==
-            BooleanNode::Type::TERM) {
-
-            auto term_it =
-                term_documents.find(
-                    node->term
-                );
-
-            if (term_it ==
-                term_documents.end()) {
-
-                return false;
-            }
-
-            return
-                term_it->second.find(
-                    document_id
-                ) != term_it->second.end();
-        }
-
-
-        /*
-         * AND
-         */
-
-        if (node->type ==
-            BooleanNode::Type::AND) {
-
-            return
-                evaluate(
-                    node->left,
-                    document_id
-                )
-                &&
-                evaluate(
-                    node->right,
-                    document_id
-                );
-        }
-
-
-        /*
-         * OR
-         */
-
-        if (node->type ==
-            BooleanNode::Type::OR) {
-
-            return
-                evaluate(
-                    node->left,
-                    document_id
-                )
-                ||
-                evaluate(
-                    node->right,
-                    document_id
-                );
-        }
-
-
-        /*
-         * NOT
-         */
-
-        if (node->type ==
-            BooleanNode::Type::NOT) {
-
-            return !evaluate(
-                node->right,
-                document_id
-            );
-        }
-
-        return false;
-    };
-
-
-    /*
-     * ========================================================
-     * FILTER CANDIDATES
-     * ========================================================
-     */
-
-    std::vector<SearchResult> results;
-
-    for (const auto& candidate :
-         candidates) {
-
-        if (evaluate(
-                root,
-                candidate.document_id
-            )) {
-
-            results.push_back(candidate);
-        }
-    }
-
-
-    /*
-     * ========================================================
-     * BM25 RANKING
-     * ========================================================
-     */
-
-    std::sort(
-        results.begin(),
-        results.end(),
-        [](const SearchResult& a,
-           const SearchResult& b) {
-
-            if (a.score != b.score) {
-                return a.score > b.score;
-            }
-
-            return
-                a.document_id <
-                b.document_id;
-        }
-    );
-
-
-    /*
-     * ========================================================
-     * TOP-K
-     * ========================================================
-     */
-
-    if (results.size() > top_k) {
-        results.resize(top_k);
-    }
-
-
-    /*
-     * ========================================================
-     * CLEAN UP
-     * ========================================================
-     */
-
-    delete_tree(root);
-
-    return results;
+    Parser parser(tokens);
+    const NodePtr root = parser.parse();
+    if (!root) return reject(parser.error());
+
+    Evaluator evaluator(index_);
+    const DocIds matches = evaluator.evaluate(*root);
+
+    std::vector<std::string> ranking_terms;
+    collect_positive_terms(*root, /*negated=*/false, ranking_terms);
+    return index_.rank_candidates(ranking_terms, matches, top_k);
 }

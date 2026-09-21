@@ -12,6 +12,12 @@ struct BenchmarkDocument {
     std::string text;
 };
 
+struct QueryBenchmarkResult {
+    std::string query;
+    double search_time_ms;
+    std::size_t results_returned;
+};
+
 int main() {
 
     std::cout << "Atlas Retrieval Engine - Benchmark\n";
@@ -21,19 +27,15 @@ int main() {
     InvertedIndex index;
 
     const int document_count = 10000;
+    const std::size_t top_k = 10;
 
     std::vector<BenchmarkDocument> documents;
     documents.reserve(document_count);
 
     /*
      * ============================================================
-     * GENERATE REALISTIC SYNTHETIC CORPUS
+     * GENERATE SYNTHETIC CORPUS
      * ============================================================
-     *
-     * Different documents contain different combinations
-     * of technical terms.
-     *
-     * This gives BM25 meaningful score differences.
      */
 
     for (int i = 1; i <= document_count; ++i) {
@@ -41,32 +43,22 @@ int main() {
         BenchmarkDocument document;
         document.id = i;
 
-        /*
-         * Every document contains some general
-         * technical vocabulary.
-         */
         document.text =
             "technical system architecture "
             "software engineering distributed computing "
             "performance reliability scalability ";
-
-        /*
-         * Documents are deliberately varied.
-         */
 
         if (i % 2 == 0) {
 
             document.text +=
                 "vector search indexing "
                 "similarity retrieval ";
-
         }
 
         if (i % 3 == 0) {
 
             document.text +=
                 "database storage query processing ";
-
         }
 
         if (i % 5 == 0) {
@@ -74,7 +66,6 @@ int main() {
             document.text +=
                 "search engine ranking "
                 "document retrieval ";
-
         }
 
         if (i % 7 == 0) {
@@ -82,7 +73,6 @@ int main() {
             document.text +=
                 "machine learning embeddings "
                 "vector database ";
-
         }
 
         if (i % 11 == 0) {
@@ -90,12 +80,7 @@ int main() {
             document.text +=
                 "distributed search "
                 "index optimization ";
-
         }
-
-        /*
-         * Make some documents longer.
-         */
 
         if (i % 13 == 0) {
 
@@ -149,33 +134,51 @@ int main() {
 
     /*
      * ============================================================
-     * SEARCH BENCHMARK
+     * MULTI-QUERY SEARCH BENCHMARK
      * ============================================================
      */
 
-    const std::string query =
-        "vector search";
+    const std::vector<std::string> queries = {
+        "vector search",
+        "retrieval search",
+        "database",
+        "machine learning",
+        "index optimization"
+    };
 
-    std::vector<std::string> query_tokens =
-        tokenizer.tokenize(query);
+    std::vector<QueryBenchmarkResult> benchmark_results;
 
+    benchmark_results.reserve(queries.size());
 
-    auto search_start =
-        std::chrono::high_resolution_clock::now();
+    for (const auto& query : queries) {
 
-    std::vector<SearchResult> results =
-        index.search(
-            query_tokens,
-            10
+        std::vector<std::string> query_tokens =
+            tokenizer.tokenize(query);
+
+        auto search_start =
+            std::chrono::high_resolution_clock::now();
+
+        std::vector<SearchResult> results =
+            index.search(
+                query_tokens,
+                top_k
+            );
+
+        auto search_end =
+            std::chrono::high_resolution_clock::now();
+
+        const std::chrono::duration<double, std::milli>
+            search_time =
+                search_end - search_start;
+
+        benchmark_results.push_back(
+            {
+                query,
+                search_time.count(),
+                results.size()
+            }
         );
-
-    auto search_end =
-        std::chrono::high_resolution_clock::now();
-
-
-    const std::chrono::duration<double, std::milli>
-        search_time =
-            search_end - search_start;
+    }
 
 
     /*
@@ -201,19 +204,16 @@ int main() {
         << "\n";
 
     std::cout
-        << "Query: "
-        << query
-        << "\n";
-
-    std::cout
-        << "Top-K: 10\n\n";
+        << "Top-K: "
+        << top_k
+        << "\n\n";
 
 
     std::cout
-        << "Benchmark results\n";
+        << "Indexing benchmark\n";
 
     std::cout
-        << "-----------------\n";
+        << "------------------\n";
 
     std::cout
         << std::fixed
@@ -222,32 +222,67 @@ int main() {
     std::cout
         << "Indexing time: "
         << indexing_time.count()
-        << " ms\n";
-
-    std::cout
-        << "Search time: "
-        << search_time.count()
-        << " ms\n";
-
-    std::cout
-        << "Results returned: "
-        << results.size()
-        << "\n\n";
+        << " ms\n\n";
 
 
     /*
      * ============================================================
-     * TOP-K RESULTS
+     * QUERY RESULTS
      * ============================================================
      */
 
     std::cout
-        << "Top results\n";
+        << "Query benchmarks\n";
 
     std::cout
-        << "-----------\n";
+        << "----------------\n";
 
-    for (const auto& result : results) {
+    for (const auto& result : benchmark_results) {
+
+        std::cout
+            << "Query: "
+            << result.query
+            << "\n";
+
+        std::cout
+            << "Search time: "
+            << result.search_time_ms
+            << " ms\n";
+
+        std::cout
+            << "Results returned: "
+            << result.results_returned
+            << "\n\n";
+    }
+
+
+    /*
+     * ============================================================
+     * TOP RESULTS FOR PRIMARY QUERY
+     * ============================================================
+     */
+
+    const std::string primary_query =
+        "vector search";
+
+    std::vector<std::string> primary_tokens =
+        tokenizer.tokenize(primary_query);
+
+    std::vector<SearchResult> primary_results =
+        index.search(
+            primary_tokens,
+            top_k
+        );
+
+    std::cout
+        << "Top results for: "
+        << primary_query
+        << "\n";
+
+    std::cout
+        << "-------------------------------\n";
+
+    for (const auto& result : primary_results) {
 
         std::cout
             << "Document ID: "

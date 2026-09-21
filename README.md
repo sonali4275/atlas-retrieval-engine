@@ -56,3 +56,25 @@ atlas-retrieval-engine/
 ├── benchmarks/
 ├── datasets/
 └── tests/
+
+## Performance Benchmark
+
+The retrieval engine was benchmarked using 10,000 synthetic documents containing 196,798 total tokens.
+
+| Metric | Result |
+|---|---:|
+| Documents | 10,000 |
+| Total tokens | 196,798 |
+| Query | `vector search` |
+| Top-K | 10 |
+| Indexing time | 101.1048 ms |
+| Search time | 5.7892 ms |
+| Results returned | 10 |
+
+### Benchmark Environment
+
+- Language: C++17
+- Build system: CMake
+- Compiler: Microsoft Visual C++
+- Build configuration: Release
+- Platform: Windows

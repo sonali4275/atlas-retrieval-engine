@@ -1,6 +1,6 @@
 # Atlas Retrieval Engine
 
-A technical knowledge retrieval engine built from scratch in C++17 using a custom inverted index, BM25 relevance ranking, positional phrase search, Boolean query processing, persistent index serialization, automated testing, and performance benchmarking.
+C++17 technical knowledge retrieval engine with inverted indexing, BM25 ranking, phrase and Boolean search, persistent serialization, automated tests, and benchmarking.
 
 ## Features
 

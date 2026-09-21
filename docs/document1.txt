@@ -1,0 +1,1 @@
+Vector search is an important technique for information retrieval. Search engines use vector representations to find relevant documents.

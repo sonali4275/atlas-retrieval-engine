@@ -1,0 +1,1 @@
+A retrieval engine uses an inverted index for fast search. Search systems improve performance through efficient indexing and ranking.

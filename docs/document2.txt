@@ -1,0 +1,1 @@
+Information retrieval systems use indexing and search algorithms. Retrieval engines process documents and queries efficiently.
